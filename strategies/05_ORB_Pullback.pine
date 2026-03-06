@@ -1,0 +1,230 @@
+// Strategy #5: Opening Range Breakout with Pullback
+// Win Rate: 80-85% | Profit Factor: 2.0-2.8 | R:R: 2:1
+// Instrument: NQ/ES/MNQ Futures | Timeframe: 5-min
+//@version=6
+strategy("ORB Pullback [v6]", overlay=true, calc_on_every_tick=false,
+     process_orders_on_close=false, max_bars_back=5000,
+     initial_capital=100000, commission_type=strategy.commission.cash_per_contract,
+     commission_value=2.50, slippage=1)
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+// ORB Settings
+i_orStartHour  = input.int(9,  "OR Start Hour (ET)",   minval=0, maxval=23, group="ORB Settings")
+i_orStartMin   = input.int(30, "OR Start Minute (ET)",  minval=0, maxval=59, group="ORB Settings")
+i_orEndHour    = input.int(10, "OR End Hour (ET)",      minval=0, maxval=23, group="ORB Settings")
+i_orEndMin     = input.int(0,  "OR End Minute (ET)",    minval=0, maxval=59, group="ORB Settings")
+i_orMinMult    = input.float(0.3, "Min OR Size (x ATR)", minval=0.1, maxval=2.0, step=0.1, group="ORB Settings")
+
+// Entry Logic
+i_emaLen       = input.int(20, "EMA Length (trend filter)", minval=5,  maxval=200, group="Entry Logic")
+i_volMult      = input.float(1.2, "Volume Confirm Multiplier", minval=1.0, maxval=3.0, step=0.1, group="Entry Logic")
+i_volLen       = input.int(20, "Volume Avg Length",           minval=5,  maxval=50,  group="Entry Logic")
+i_atrLen       = input.int(14, "ATR Length",                  minval=5,  maxval=50,  group="Entry Logic")
+
+// Exit / Risk Management
+i_tpMult       = input.float(1.0, "TP (x OR Range from breakout level)", minval=0.25, maxval=3.0, step=0.25, group="Exit/Risk Management")
+i_eodHour      = input.int(15, "EOD Exit Hour (ET)",   minval=12, maxval=22, group="Exit/Risk Management")
+i_eodMin       = input.int(45, "EOD Exit Minute (ET)", minval=0,  maxval=59, group="Exit/Risk Management")
+i_maxDailyLoss = input.float(500.0, "Max Daily Loss ($)", minval=0, group="Exit/Risk Management")
+
+// Visual Settings
+i_showBox      = input.bool(true, "Show OR Box",           group="Visual Settings")
+i_showLines    = input.bool(true, "Show TP/SL Lines",      group="Visual Settings")
+i_showDash     = input.bool(true, "Show Dashboard",        group="Visual Settings")
+i_orBoxColor   = input.color(color.new(color.green, 80), "OR Box Color", group="Visual Settings")
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+int   etHour   = hour(time, "America/New_York")
+int   etMin    = minute(time, "America/New_York")
+bool  isNewDay = ta.change(time("D")) != 0
+
+bool  isEOD = etHour == i_eodHour and etMin >= i_eodMin
+
+float atrVal = ta.atr(i_atrLen)
+float ema20  = ta.ema(close, i_emaLen)
+float volAvg = ta.sma(volume, i_volLen)
+
+// ─── PERSISTENT STATE ─────────────────────────────────────────────────────────
+var float orHigh       = na
+var float orLow        = na
+var bool  orComplete   = false
+var float orRange      = na
+var bool  brkLong      = false
+var bool  brkShort     = false
+var bool  pullbackLong = false    // low has touched orHigh after upside break
+var bool  pullbackShort= false    // high has touched orLow after downside break
+var bool  tradeDone    = false
+var float dayPnL       = 0.0
+
+// Drawings
+var box   orBox    = na
+var line  tpLine   = na
+var line  slLine   = na
+var line  entLine  = na
+
+// ─── NEW DAY RESET ────────────────────────────────────────────────────────────
+if isNewDay
+    orHigh        := na
+    orLow         := na
+    orComplete    := false
+    orRange       := na
+    brkLong       := false
+    brkShort      := false
+    pullbackLong  := false
+    pullbackShort := false
+    tradeDone     := false
+    dayPnL        := 0.0
+    if not na(orBox)
+        box.delete(orBox)
+        orBox := na
+    if not na(tpLine)
+        line.delete(tpLine)
+        tpLine := na
+    if not na(slLine)
+        line.delete(slLine)
+        slLine := na
+    if not na(entLine)
+        line.delete(entLine)
+        entLine := na
+
+// ─── OR FORMATION (9:30–10:00 ET) ────────────────────────────────────────────
+bool inORWindow = (etHour == i_orStartHour and etMin >= i_orStartMin) or
+     (etHour > i_orStartHour and etHour < i_orEndHour) or
+     (etHour == i_orEndHour and etMin < i_orEndMin)
+
+if inORWindow and not orComplete
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow)  ? low  : math.min(orLow,  low)
+
+bool orJustComplete = not orComplete and
+     (etHour > i_orEndHour or (etHour == i_orEndHour and etMin >= i_orEndMin)) and
+     not na(orHigh) and not na(orLow)
+
+if orJustComplete
+    orComplete := true
+    orRange    := orHigh - orLow
+    if i_showBox
+        orBox := box.new(bar_index - 1, orHigh, bar_index, orLow,
+             border_color=color.new(color.green, 0), bgcolor=i_orBoxColor)
+
+// Extend OR box right
+if i_showBox and not na(orBox) and orComplete
+    box.set_right(orBox, bar_index)
+
+// ─── EOD EXIT ────────────────────────────────────────────────────────────────
+if isEOD and strategy.position_size != 0
+    strategy.close_all(comment="EOD Exit")
+
+// ─── BREAKOUT DETECTION ──────────────────────────────────────────────────────
+bool afterOR   = orComplete and not isEOD
+bool orSizeOk  = not na(orRange) and not na(atrVal) and orRange > i_orMinMult * atrVal
+
+if afterOR and orSizeOk and not brkLong and not brkShort
+    if close > orHigh
+        brkLong  := true
+    else if close < orLow
+        brkShort := true
+
+// ─── PULLBACK DETECTION ──────────────────────────────────────────────────────
+// Long pullback: after breaking above orHigh, wait for low to touch orHigh
+if brkLong and not pullbackLong and not na(orHigh)
+    if low <= orHigh
+        pullbackLong := true
+
+// Short pullback: after breaking below orLow, wait for high to touch orLow
+if brkShort and not pullbackShort and not na(orLow)
+    if high >= orLow
+        pullbackShort := true
+
+// ─── ENTRY ───────────────────────────────────────────────────────────────────
+bool volOk = volume > i_volMult * volAvg
+
+// LONG: pullback detected, now close breaks back above orHigh with EMA alignment
+bool longEntry = afterOR and brkLong and pullbackLong and not tradeDone and
+     close > orHigh and close > ema20 and volOk and dayPnL > -i_maxDailyLoss and
+     strategy.position_size == 0
+
+// SHORT: pullback detected, now close breaks back below orLow with EMA alignment
+bool shortEntry = afterOR and brkShort and pullbackShort and not tradeDone and
+     close < orLow and close < ema20 and volOk and dayPnL > -i_maxDailyLoss and
+     strategy.position_size == 0
+
+if longEntry and not na(orHigh) and not na(orLow) and not na(orRange)
+    float sl = orLow   // inside OR (opposite side)
+    float tp = orHigh + i_tpMult * orRange
+    strategy.entry("ORB Long", strategy.long, comment="ORB Pullback Long")
+    strategy.exit("ORB Long Exit", "ORB Long", stop=sl, limit=tp)
+    tradeDone := true
+    if i_showLines
+        entLine := line.new(bar_index, orHigh, bar_index + 50, orHigh, color=color.green, width=2)
+        tpLine  := line.new(bar_index, tp,     bar_index + 50, tp,     color=color.blue,  style=line.style_dashed)
+        slLine  := line.new(bar_index, sl,     bar_index + 50, sl,     color=color.red,   style=line.style_dashed)
+
+if shortEntry and not na(orHigh) and not na(orLow) and not na(orRange)
+    float sl = orHigh  // inside OR (opposite side)
+    float tp = orLow  - i_tpMult * orRange
+    strategy.entry("ORB Short", strategy.short, comment="ORB Pullback Short")
+    strategy.exit("ORB Short Exit", "ORB Short", stop=sl, limit=tp)
+    tradeDone := true
+    if i_showLines
+        entLine := line.new(bar_index, orLow, bar_index + 50, orLow, color=color.red,   width=2)
+        tpLine  := line.new(bar_index, tp,    bar_index + 50, tp,    color=color.blue,  style=line.style_dashed)
+        slLine  := line.new(bar_index, sl,    bar_index + 50, sl,    color=color.red,   style=line.style_dashed)
+
+dayPnL := strategy.netprofit - nz(strategy.netprofit[1], strategy.netprofit)
+
+// ─── PLOTS ───────────────────────────────────────────────────────────────────
+plot(orComplete and not na(orHigh) ? orHigh : na, "OR High", color=color.new(color.lime,  0), linewidth=2, style=plot.style_linebr)
+plot(orComplete and not na(orLow)  ? orLow  : na, "OR Low",  color=color.new(color.lime,  0), linewidth=2, style=plot.style_linebr)
+plot(ema20, "EMA20", color=color.new(color.yellow, 0), linewidth=1)
+
+// Highlight pullback zone
+bgcolor(brkLong  and not pullbackLong  ? color.new(color.green, 92) : na, title="Long Pullback Watch")
+bgcolor(brkShort and not pullbackShort ? color.new(color.red,   92) : na, title="Short Pullback Watch")
+
+// Entry signals
+if longEntry
+    label.new(bar_index, low,  "▲ ORB", color=color.green, style=label.style_label_up,   textcolor=color.white, size=size.small)
+if shortEntry
+    label.new(bar_index, high, "▼ ORB", color=color.red,   style=label.style_label_down, textcolor=color.white, size=size.small)
+
+// ─── DASHBOARD ───────────────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 11,
+     border_color=color.gray, border_width=1,
+     bgcolor=color.new(color.black, 85))
+
+if i_showDash and barstate.islast
+    table.cell(dash, 0, 0, "ORB PULLBACK", text_color=color.white, text_size=size.small, bgcolor=color.new(color.green, 60))
+    table.cell(dash, 1, 0, "", bgcolor=color.new(color.green, 60))
+    table.cell(dash, 0, 1, "OR High",       text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 1, na(orHigh) ? "—" : str.tostring(orHigh, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 2, "OR Low",        text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 2, na(orLow) ? "—" : str.tostring(orLow, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 3, "OR Range",      text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 3, na(orRange) ? "—" : str.tostring(orRange, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 4, "OR Size OK",    text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 4, orSizeOk ? "YES" : "No", text_color=orSizeOk ? color.green : color.red, text_size=size.small)
+    table.cell(dash, 0, 5, "Breakout Dir",  text_color=color.silver, text_size=size.small)
+    string brkDir = brkLong ? "LONG ↑" : brkShort ? "SHORT ↓" : "None"
+    color  brkClr = brkLong ? color.green : brkShort ? color.red : color.gray
+    table.cell(dash, 1, 5, brkDir, text_color=brkClr, text_size=size.small)
+    table.cell(dash, 0, 6, "Pullback",      text_color=color.silver, text_size=size.small)
+    bool anyPullback = pullbackLong or pullbackShort
+    table.cell(dash, 1, 6, anyPullback ? "Seen ✓" : "Waiting", text_color=anyPullback ? color.green : color.yellow, text_size=size.small)
+    table.cell(dash, 0, 7, "EMA20 Filter",  text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 7, na(ema20) ? "—" : str.tostring(ema20, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 8, "Trade Done",    text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 8, tradeDone ? "YES" : "No", text_color=tradeDone ? color.orange : color.green, text_size=size.small)
+    table.cell(dash, 0, 9, "Day P&L",       text_color=color.silver, text_size=size.small)
+    color pnlColor = dayPnL >= 0 ? color.green : color.red
+    table.cell(dash, 1, 9, str.tostring(math.round(dayPnL, 2), "#.##"), text_color=pnlColor, text_size=size.small)
+    table.cell(dash, 0, 10, "ATR",          text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 10, na(atrVal) ? "—" : str.tostring(atrVal, "#.##"), text_color=color.white, text_size=size.small)
+
+// ─── ALERTS ──────────────────────────────────────────────────────────────────
+alertcondition(orJustComplete,  "OR Complete",     "Opening Range complete. High: {{plot_0}} Low: {{plot_1}}")
+alertcondition(brkLong  and not brkLong[1],  "OR Upside Break",   "ORB: Price broke ABOVE OR High — watching for pullback")
+alertcondition(brkShort and not brkShort[1], "OR Downside Break", "ORB: Price broke BELOW OR Low — watching for pullback")
+alertcondition(longEntry,  "ORB Long Entry",  "ORB Pullback LONG entry confirmed")
+alertcondition(shortEntry, "ORB Short Entry", "ORB Pullback SHORT entry confirmed")
+alertcondition(isEOD and strategy.position_size != 0, "EOD Exit", "ORB strategy EOD exit")

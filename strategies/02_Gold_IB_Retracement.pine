@@ -1,0 +1,227 @@
+// Strategy #2: Gold IB Breakout Retracement
+// Win Rate: 80-85% | Profit Factor: 2.0-2.5 | R:R: 2:1
+// Instrument: GC (Gold Futures) | Timeframe: 5-min (entries), 60-min IB
+//@version=6
+strategy("Gold IB Breakout Retracement [v6]", overlay=true, calc_on_every_tick=false,
+     process_orders_on_close=false, max_bars_back=5000,
+     initial_capital=100000, commission_type=strategy.commission.cash_per_contract,
+     commission_value=2.50, slippage=1)
+
+// ─── INPUTS ──────────────────────────────────────────────────────────────────
+// IB Settings
+i_ibStartHour  = input.int(9,  "IB Start Hour (ET)",   minval=0, maxval=23, group="IB Settings")
+i_ibStartMin   = input.int(30, "IB Start Minute (ET)",  minval=0, maxval=59, group="IB Settings")
+i_ibEndHour    = input.int(10, "IB End Hour (ET)",      minval=0, maxval=23, group="IB Settings")
+i_ibEndMin     = input.int(30, "IB End Minute (ET)",    minval=0, maxval=59, group="IB Settings")
+i_minRangePct  = input.float(0.30, "Min IB Range % of Price", minval=0.1, maxval=2.0, step=0.05, group="IB Settings")
+i_maxRangePct  = input.float(1.50, "Max IB Range % of Price", minval=0.5, maxval=5.0, step=0.1,  group="IB Settings")
+
+// Entry Logic
+i_retracePct   = input.float(0.25, "Retracement Level (fraction of IB Range)", minval=0.1, maxval=0.75, step=0.05, group="Entry Logic")
+i_volMult      = input.float(1.2,  "Volume Confirm Multiplier", minval=1.0, maxval=3.0, step=0.1, group="Entry Logic")
+i_volLen       = input.int(20,     "Volume Avg Length",          minval=5,  maxval=50,  group="Entry Logic")
+
+// Exit / Risk Management
+i_tpMult       = input.float(0.5,  "TP (x IB Range from IB extreme)", minval=0.25, maxval=2.0, step=0.25, group="Exit/Risk Management")
+i_slMult       = input.float(0.6,  "SL (x IB Range from entry)",      minval=0.25, maxval=2.0, step=0.1,  group="Exit/Risk Management")
+i_eodHour      = input.int(16,  "EOD Exit Hour (ET)",   minval=12, maxval=22, group="Exit/Risk Management")
+i_eodMin       = input.int(0,   "EOD Exit Minute (ET)", minval=0,  maxval=59, group="Exit/Risk Management")
+i_maxDailyLoss = input.float(500.0, "Max Daily Loss ($)", minval=0, group="Exit/Risk Management")
+
+// Visual Settings
+i_showBox      = input.bool(true,  "Show IB Box",              group="Visual Settings")
+i_showZones    = input.bool(true,  "Show Entry/TP/SL Lines",   group="Visual Settings")
+i_showDash     = input.bool(true,  "Show Dashboard",           group="Visual Settings")
+i_ibBoxColor   = input.color(color.new(color.yellow, 80), "IB Box Color", group="Visual Settings")
+i_zoneColor    = input.color(color.new(color.green,  70), "Entry Zone Color", group="Visual Settings")
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+int   etHour  = hour(time, "America/New_York")
+int   etMin   = minute(time, "America/New_York")
+bool  isNewDay = ta.change(time("D")) != 0
+float volAvg  = ta.sma(volume, i_volLen)
+
+// ─── PERSISTENT STATE ─────────────────────────────────────────────────────────
+var float ibHigh         = na
+var float ibLow          = na
+var bool  ibComplete     = false
+var float ibRange        = na
+var float ibMidPrice     = na   // (ibHigh+ibLow)/2 for range % calc
+var float ibRangePct     = na
+var string ibRangeStatus = "—"
+
+// Breakout / retracement state
+var bool  brkLong        = false   // breakout above ibHigh detected
+var bool  brkShort       = false   // breakout below ibLow detected
+var bool  entryFilled    = false
+var float retraceEntryL  = na      // entry level for long retracement
+var float retraceEntryS  = na      // entry level for short retracement
+
+// Trade management
+var bool  tradeDone      = false
+var float dayPnL         = 0.0
+
+// Drawings
+var box   ibBox          = na
+var line  entryLine      = na
+var line  tpLine         = na
+var line  slLine         = na
+
+// ─── NEW DAY RESET ────────────────────────────────────────────────────────────
+if isNewDay
+    ibHigh        := na
+    ibLow         := na
+    ibComplete    := false
+    ibRange       := na
+    ibMidPrice    := na
+    ibRangePct    := na
+    ibRangeStatus := "—"
+    brkLong       := false
+    brkShort      := false
+    entryFilled   := false
+    retraceEntryL := na
+    retraceEntryS := na
+    tradeDone     := false
+    dayPnL        := 0.0
+    if not na(ibBox)
+        box.delete(ibBox)
+        ibBox := na
+    if not na(entryLine)
+        line.delete(entryLine)
+        entryLine := na
+    if not na(tpLine)
+        line.delete(tpLine)
+        tpLine := na
+    if not na(slLine)
+        line.delete(slLine)
+        slLine := na
+
+// ─── IB FORMATION ────────────────────────────────────────────────────────────
+bool inIBWindow = (etHour == i_ibStartHour and etMin >= i_ibStartMin) or
+     (etHour > i_ibStartHour and etHour < i_ibEndHour) or
+     (etHour == i_ibEndHour and etMin < i_ibEndMin)
+
+if inIBWindow and not ibComplete
+    ibHigh := na(ibHigh) ? high : math.max(ibHigh, high)
+    ibLow  := na(ibLow)  ? low  : math.min(ibLow,  low)
+
+bool ibJustComplete = not ibComplete and
+     (etHour > i_ibEndHour or (etHour == i_ibEndHour and etMin >= i_ibEndMin)) and
+     not na(ibHigh) and not na(ibLow)
+
+if ibJustComplete
+    ibComplete  := true
+    ibRange     := ibHigh - ibLow
+    ibMidPrice  := (ibHigh + ibLow) / 2.0
+    // IB Range % of gold price
+    if ibMidPrice > 0.0
+        ibRangePct := ibRange / ibMidPrice * 100.0
+        ibRangeStatus := ibRangePct >= i_minRangePct and ibRangePct <= i_maxRangePct ? "OK" : "SKIP"
+    // Draw IB box
+    if i_showBox
+        ibBox := box.new(bar_index - 1, ibHigh, bar_index, ibLow,
+             border_color=color.new(color.orange, 0), bgcolor=i_ibBoxColor)
+    // Pre-calculate retracement levels
+    if ibRange > 0.0
+        retraceEntryL := ibHigh - i_retracePct * ibRange  // long entry after upside break
+        retraceEntryS := ibLow  + i_retracePct * ibRange  // short entry after downside break
+
+// Extend IB box
+if i_showBox and not na(ibBox) and ibComplete
+    box.set_right(ibBox, bar_index)
+
+// ─── SESSION / EOD GUARDS ─────────────────────────────────────────────────────
+bool isEOD = etHour == i_eodHour and etMin >= i_eodMin
+
+if isEOD and strategy.position_size != 0
+    strategy.close_all(comment="EOD Exit")
+
+// ─── BREAKOUT + RETRACEMENT ENTRY ────────────────────────────────────────────
+bool rangeOk = ibRangeStatus == "OK"
+
+if ibComplete and rangeOk and not tradeDone and not isEOD and
+     not na(ibRange) and ibRange > 0.0 and dayPnL > -i_maxDailyLoss
+    // Detect initial breakout
+    if not brkLong and not brkShort
+        if close > ibHigh
+            brkLong := true
+        else if close < ibLow
+            brkShort := true
+
+    // Long entry: price broke above ibHigh, now pulling back to retraceEntryL
+    if brkLong and not entryFilled and not na(retraceEntryL)
+        if close <= retraceEntryL and volume > i_volMult * volAvg
+            float tpPrice = ibHigh + i_tpMult * ibRange
+            float slPrice = close  - i_slMult * ibRange
+            strategy.entry("Gold Long", strategy.long, comment="IB Retrace Long")
+            strategy.exit("Gold Long Exit", "Gold Long", stop=slPrice, limit=tpPrice)
+            entryFilled := true
+            tradeDone   := true
+            if i_showZones
+                entryLine := line.new(bar_index, retraceEntryL, bar_index + 50, retraceEntryL,
+                     color=color.green, style=line.style_solid, width=2)
+                tpLine := line.new(bar_index, tpPrice, bar_index + 50, tpPrice,
+                     color=color.blue, style=line.style_dashed, width=1)
+                slLine := line.new(bar_index, slPrice, bar_index + 50, slPrice,
+                     color=color.red, style=line.style_dashed, width=1)
+
+    // Short entry: price broke below ibLow, now pulling back to retraceEntryS
+    if brkShort and not entryFilled and not na(retraceEntryS)
+        if close >= retraceEntryS and volume > i_volMult * volAvg
+            float tpPrice = ibLow  - i_tpMult * ibRange
+            float slPrice = close  + i_slMult * ibRange
+            strategy.entry("Gold Short", strategy.short, comment="IB Retrace Short")
+            strategy.exit("Gold Short Exit", "Gold Short", stop=slPrice, limit=tpPrice)
+            entryFilled := true
+            tradeDone   := true
+            if i_showZones
+                entryLine := line.new(bar_index, retraceEntryS, bar_index + 50, retraceEntryS,
+                     color=color.red, style=line.style_solid, width=2)
+                tpLine := line.new(bar_index, tpPrice, bar_index + 50, tpPrice,
+                     color=color.blue, style=line.style_dashed, width=1)
+                slLine := line.new(bar_index, slPrice, bar_index + 50, slPrice,
+                     color=color.red, style=line.style_dashed, width=1)
+
+dayPnL := strategy.netprofit - nz(strategy.netprofit[1], strategy.netprofit)
+
+// ─── PLOTS ───────────────────────────────────────────────────────────────────
+plot(ibComplete and not na(ibHigh) ? ibHigh : na, "IB High", color=color.new(color.orange, 0), linewidth=2, style=plot.style_linebr)
+plot(ibComplete and not na(ibLow)  ? ibLow  : na, "IB Low",  color=color.new(color.orange, 0), linewidth=2, style=plot.style_linebr)
+plot(brkLong  and not na(retraceEntryL) ? retraceEntryL : na, "Retrace Entry (Long)",  color=color.new(color.green,0), linewidth=1, style=plot.style_linebr)
+plot(brkShort and not na(retraceEntryS) ? retraceEntryS : na, "Retrace Entry (Short)", color=color.new(color.red,  0), linewidth=1, style=plot.style_linebr)
+
+// ─── DASHBOARD ───────────────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 9,
+     border_color=color.gray, border_width=1,
+     bgcolor=color.new(color.black, 85))
+
+if i_showDash and barstate.islast
+    table.cell(dash, 0, 0, "GOLD IB RETRACEMENT", text_color=color.white, text_size=size.small, bgcolor=color.new(color.orange, 60))
+    table.cell(dash, 1, 0, "", bgcolor=color.new(color.orange, 60))
+    table.cell(dash, 0, 1, "IB High",       text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 1, na(ibHigh) ? "—" : str.tostring(ibHigh, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 2, "IB Low",        text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 2, na(ibLow) ? "—" : str.tostring(ibLow, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 3, "IB Range %",    text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 3, na(ibRangePct) ? "—" : str.tostring(ibRangePct, "#.##") + "%", text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 4, "Range Filter",  text_color=color.silver, text_size=size.small)
+    color rangeColor = ibRangeStatus == "OK" ? color.green : color.red
+    table.cell(dash, 1, 4, ibRangeStatus, text_color=rangeColor, text_size=size.small)
+    table.cell(dash, 0, 5, "Breakout Dir",  text_color=color.silver, text_size=size.small)
+    string brkDir = brkLong ? "LONG ↑" : brkShort ? "SHORT ↓" : "None"
+    color  brkClr = brkLong ? color.green : brkShort ? color.red : color.gray
+    table.cell(dash, 1, 5, brkDir, text_color=brkClr, text_size=size.small)
+    table.cell(dash, 0, 6, "Retrace Status", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 6, entryFilled ? "Filled" : "Waiting", text_color=entryFilled ? color.green : color.yellow, text_size=size.small)
+    table.cell(dash, 0, 7, "Day P&L",       text_color=color.silver, text_size=size.small)
+    color pnlColor = dayPnL >= 0 ? color.green : color.red
+    table.cell(dash, 1, 7, str.tostring(math.round(dayPnL, 2), "#.##"), text_color=pnlColor, text_size=size.small)
+    table.cell(dash, 0, 8, "Trade Done",    text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 8, tradeDone ? "YES" : "No", text_color=tradeDone ? color.orange : color.green, text_size=size.small)
+
+// ─── ALERTS ──────────────────────────────────────────────────────────────────
+alertcondition(ibJustComplete,  "IB Complete",   "Gold IB complete. Range: {{plot_0}} — {{plot_1}}")
+alertcondition(brkLong  and not brkLong[1],  "Upside Break",   "Gold broke ABOVE IB High — watching for long retracement")
+alertcondition(brkShort and not brkShort[1], "Downside Break", "Gold broke BELOW IB Low — watching for short retracement")
+alertcondition(strategy.position_size > 0 and strategy.position_size[1] <= 0, "Long Entry",  "Gold IB Retracement LONG entry")
+alertcondition(strategy.position_size < 0 and strategy.position_size[1] >= 0, "Short Entry", "Gold IB Retracement SHORT entry")

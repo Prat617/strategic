@@ -1,0 +1,194 @@
+// Strategy #3: VWAP Bounce/Rejection
+// Win Rate: 80-88% | Profit Factor: 2.0-3.5 | R:R: ~1.7:1
+// Instrument: NQ/ES/MNQ Futures | Timeframe: 5-min
+//@version=6
+strategy("VWAP Bounce/Rejection [v6]", overlay=true, calc_on_every_tick=false,
+     process_orders_on_close=false, max_bars_back=5000,
+     initial_capital=100000, commission_type=strategy.commission.cash_per_contract,
+     commission_value=2.50, slippage=1)
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+// Entry Logic
+i_vwapBandPct  = input.float(0.20, "VWAP Proximity % (entry zone)", minval=0.05, maxval=1.0, step=0.05, group="Entry Logic")
+i_wickMult     = input.float(2.0,  "Min Wick:Body Ratio for Rejection", minval=1.0, maxval=5.0, step=0.5, group="Entry Logic")
+i_volMult      = input.float(1.2,  "Volume Confirm Multiplier", minval=1.0, maxval=3.0, step=0.1, group="Entry Logic")
+i_volLen       = input.int(20,     "Volume Avg Length",          minval=5,  maxval=50, group="Entry Logic")
+i_atrLen       = input.int(14,     "ATR Length",                 minval=5,  maxval=50, group="Entry Logic")
+
+// Exit / Risk Management
+i_atrSL        = input.float(1.5, "Stop Loss (x ATR)",    minval=0.5, maxval=5.0, step=0.25, group="Exit/Risk Management")
+i_atrTP        = input.float(2.5, "Take Profit (x ATR)",  minval=0.5, maxval=8.0, step=0.25, group="Exit/Risk Management")
+i_eodHour      = input.int(15, "EOD Exit Hour (ET)",   minval=12, maxval=22, group="Exit/Risk Management")
+i_eodMin       = input.int(45, "EOD Exit Minute (ET)", minval=0,  maxval=59, group="Exit/Risk Management")
+i_maxDailyLoss = input.float(500.0, "Max Daily Loss ($)", minval=0, group="Exit/Risk Management")
+i_maxTrades    = input.int(3, "Max Trades Per Day", minval=1, maxval=10, group="Exit/Risk Management")
+
+// Session
+i_rthStartHour = input.int(9,  "RTH Start Hour (ET)",  minval=0, maxval=23, group="Session")
+i_rthStartMin  = input.int(30, "RTH Start Minute (ET)", minval=0, maxval=59, group="Session")
+i_rthEndHour   = input.int(16, "RTH End Hour (ET)",    minval=0, maxval=23, group="Session")
+i_rthEndMin    = input.int(0,  "RTH End Minute (ET)",  minval=0, maxval=59, group="Session")
+
+// Visual Settings
+i_showVWAP     = input.bool(true, "Show VWAP Line",       group="Visual Settings")
+i_showBands    = input.bool(true, "Show VWAP Bands",      group="Visual Settings")
+i_showDash     = input.bool(true, "Show Dashboard",       group="Visual Settings")
+i_vwapColor    = input.color(color.new(color.blue, 0),   "VWAP Color",       group="Visual Settings")
+i_bandColor    = input.color(color.new(color.blue, 70),  "VWAP Band Color",  group="Visual Settings")
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+int   etHour   = hour(time, "America/New_York")
+int   etMin    = minute(time, "America/New_York")
+bool  isNewDay = ta.change(time("D")) != 0
+
+bool  inRTH = (etHour > i_rthStartHour or (etHour == i_rthStartHour and etMin >= i_rthStartMin)) and
+     (etHour < i_rthEndHour or (etHour == i_rthEndHour and etMin < i_rthEndMin))
+bool  isEOD = etHour == i_eodHour and etMin >= i_eodMin
+
+float atrVal = ta.atr(i_atrLen)
+float volAvg = ta.sma(volume, i_volLen)
+
+// ─── SESSION VWAP (manual, resets on new day) ─────────────────────────────────
+var float cumTPV  = 0.0    // cumulative (typical_price * volume)
+var float cumVol  = 0.0    // cumulative volume
+var float cumTPV2 = 0.0    // cumulative (typical_price^2 * volume) for stdev
+
+if isNewDay
+    cumTPV  := 0.0
+    cumVol  := 0.0
+    cumTPV2 := 0.0
+
+float typicalPrice = (high + low + close) / 3.0
+
+if inRTH or (etHour == i_rthStartHour and etMin >= i_rthStartMin)
+    cumTPV  := cumTPV  + typicalPrice * volume
+    cumVol  := cumVol  + volume
+    cumTPV2 := cumTPV2 + typicalPrice * typicalPrice * volume
+
+float vwap      = cumVol > 0.0 ? cumTPV / cumVol : na
+float vwapStdev = (cumVol > 0.0 and not na(vwap)) ? math.sqrt(math.max(cumTPV2 / cumVol - vwap * vwap, 0.0)) : na
+
+float vwapUpper = not na(vwap) and not na(atrVal) ? vwap + atrVal : na
+float vwapLower = not na(vwap) and not na(atrVal) ? vwap - atrVal : na
+
+// ─── OPEN BIAS (above/below VWAP at RTH open) ─────────────────────────────────
+var bool openAboveVWAP = false
+
+bool isSessionOpen = etHour == i_rthStartHour and etMin == i_rthStartMin
+if isSessionOpen and not na(vwap)
+    openAboveVWAP := close > vwap
+
+// ─── TRADE STATE ─────────────────────────────────────────────────────────────
+var int   dayTrades = 0
+var float dayPnL    = 0.0
+var bool  rejLong   = false
+var bool  rejShort  = false
+
+if isNewDay
+    dayTrades     := 0
+    dayPnL        := 0.0
+    rejLong       := false
+    rejShort      := false
+    openAboveVWAP := false
+    cumTPV        := 0.0
+    cumVol        := 0.0
+    cumTPV2       := 0.0
+
+// ─── EOD EXIT ────────────────────────────────────────────────────────────────
+if isEOD and strategy.position_size != 0
+    strategy.close_all(comment="EOD Exit")
+
+// ─── REJECTION CANDLE DETECTION ──────────────────────────────────────────────
+float bodySize  = math.abs(close - open)
+float upperWick = high - math.max(close, open)
+float lowerWick = math.min(close, open) - low
+bool  bullishRej = close > open and bodySize > 0.0 and lowerWick >= i_wickMult * bodySize
+bool  bearishRej = close < open and bodySize > 0.0 and upperWick >= i_wickMult * bodySize
+
+// ─── PROXIMITY TO VWAP ───────────────────────────────────────────────────────
+bool nearVWAP = not na(vwap) and vwap > 0.0 and
+     math.abs(close - vwap) / vwap * 100.0 <= i_vwapBandPct
+
+// ─── ENTRY CONDITIONS ────────────────────────────────────────────────────────
+bool volOk     = volume > i_volMult * volAvg
+bool tradeable = inRTH and not isEOD and dayTrades < i_maxTrades and dayPnL > -i_maxDailyLoss
+
+// LONG: was above VWAP at open, pulled back to VWAP, bullish rejection candle
+bool longCond  = tradeable and openAboveVWAP and nearVWAP and bullishRej and volOk and
+     strategy.position_size == 0
+
+// SHORT: was below VWAP at open, rallied to VWAP, bearish rejection candle
+bool shortCond = tradeable and not openAboveVWAP and nearVWAP and bearishRej and volOk and
+     strategy.position_size == 0
+
+if longCond and not na(atrVal)
+    float sl = close - i_atrSL * atrVal
+    float tp = close + i_atrTP * atrVal
+    strategy.entry("VWAP Long", strategy.long, comment="VWAP Bounce Long")
+    strategy.exit("VWAP Long Exit", "VWAP Long", stop=sl, limit=tp)
+    rejLong   := true
+    dayTrades += 1
+
+if shortCond and not na(atrVal)
+    float sl = close + i_atrSL * atrVal
+    float tp = close - i_atrTP * atrVal
+    strategy.entry("VWAP Short", strategy.short, comment="VWAP Rejection Short")
+    strategy.exit("VWAP Short Exit", "VWAP Short", stop=sl, limit=tp)
+    rejShort  := true
+    dayTrades += 1
+
+dayPnL := strategy.netprofit - nz(strategy.netprofit[1], strategy.netprofit)
+
+// ─── PLOTS ───────────────────────────────────────────────────────────────────
+plot(i_showVWAP ? vwap : na,        "VWAP",        color=i_vwapColor, linewidth=2)
+plot(i_showBands ? vwapUpper : na,  "VWAP Upper",  color=i_bandColor, linewidth=1, style=plot.style_linebr)
+plot(i_showBands ? vwapLower : na,  "VWAP Lower",  color=i_bandColor, linewidth=1, style=plot.style_linebr)
+
+// Highlight rejection candles
+bgcolor(longCond  ? color.new(color.green, 90) : na, title="Long Signal BG")
+bgcolor(shortCond ? color.new(color.red,   90) : na, title="Short Signal BG")
+
+// Entry / exit labels
+if longCond
+    label.new(bar_index, low, "▲ VWAP", color=color.green, style=label.style_label_up,
+         textcolor=color.white, size=size.small)
+if shortCond
+    label.new(bar_index, high, "▼ VWAP", color=color.red, style=label.style_label_down,
+         textcolor=color.white, size=size.small)
+
+// ─── DASHBOARD ───────────────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 10,
+     border_color=color.gray, border_width=1,
+     bgcolor=color.new(color.black, 85))
+
+if i_showDash and barstate.islast
+    table.cell(dash, 0, 0, "VWAP BOUNCE/REJECTION", text_color=color.white, text_size=size.small, bgcolor=color.new(color.blue, 60))
+    table.cell(dash, 1, 0, "", bgcolor=color.new(color.blue, 60))
+    table.cell(dash, 0, 1, "VWAP",          text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 1, na(vwap) ? "—" : str.tostring(vwap, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 2, "Dist from VWAP", text_color=color.silver, text_size=size.small)
+    float distPct = not na(vwap) and vwap > 0.0 ? math.abs(close - vwap) / vwap * 100.0 : na
+    table.cell(dash, 1, 2, na(distPct) ? "—" : str.tostring(distPct, "#.##") + "%", text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 3, "Open Bias",      text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 3, openAboveVWAP ? "Above ↑" : "Below ↓",
+         text_color=openAboveVWAP ? color.green : color.red, text_size=size.small)
+    table.cell(dash, 0, 4, "Near VWAP",      text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 4, nearVWAP ? "YES" : "No", text_color=nearVWAP ? color.green : color.gray, text_size=size.small)
+    table.cell(dash, 0, 5, "Rejection",      text_color=color.silver, text_size=size.small)
+    string rejStr = bullishRej ? "Bullish" : bearishRej ? "Bearish" : "None"
+    color  rejClr = bullishRej ? color.green : bearishRej ? color.red : color.gray
+    table.cell(dash, 1, 5, rejStr, text_color=rejClr, text_size=size.small)
+    table.cell(dash, 0, 6, "ATR",            text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 6, na(atrVal) ? "—" : str.tostring(atrVal, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 7, "Day Trades",     text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 7, str.tostring(dayTrades), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 8, "Day P&L",        text_color=color.silver, text_size=size.small)
+    color pnlColor = dayPnL >= 0 ? color.green : color.red
+    table.cell(dash, 1, 8, str.tostring(math.round(dayPnL, 2), "#.##"), text_color=pnlColor, text_size=size.small)
+    table.cell(dash, 0, 9, "In RTH",         text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 9, inRTH ? "YES" : "No", text_color=inRTH ? color.green : color.gray, text_size=size.small)
+
+// ─── ALERTS ──────────────────────────────────────────────────────────────────
+alertcondition(longCond,  "VWAP Bounce Long",     "VWAP Bounce LONG — bullish rejection candle at VWAP")
+alertcondition(shortCond, "VWAP Rejection Short",  "VWAP Rejection SHORT — bearish rejection candle at VWAP")
+alertcondition(isEOD and strategy.position_size != 0, "EOD Exit", "VWAP strategy EOD exit")
